@@ -24,29 +24,29 @@ def process_client_to_camera(data, b_addr, c_addr, name):
     2. Authorization 헤더의 주소는 그대로 유지 (401 인증 에러 방지)
     """
     try:
+        # 바이트 데이터를 문자열로 변환
         text = data.decode('utf-8', errors='ignore')
         lines = text.split("\r\n")
-        if not lines: return data
+        if not lines or not lines[0]: return data
 
-        # [로그] 클라이언트로부터 받은 원본 데이터 첫 줄 출력
-        print(f"[{get_time()}] [{name}] [CLIENT -> BRIDGE] {lines[0]}")
+        # [로그] 클라이언트로부터 받은 원본 데이터 출력
+        print(f"[{get_time()}] [{name}] [FROM CLIENT] {lines[0]}")
 
-        is_request_line = any(lines[0].startswith(verb) for verb in [b'DESCRIBE', b'SETUP', b'PLAY', b'OPTIONS', b'TEARDOWN'])
+        # RTSP 메서드 확인 (문자열 비교로 수정)
+        verbs = ['DESCRIBE', 'SETUP', 'PLAY', 'OPTIONS', 'TEARDOWN', 'GET_PARAMETER']
+        is_request_line = any(lines[0].startswith(verb) for verb in verbs)
         
         if is_request_line:
-            # 첫 줄의 브릿지 주소를 카메라 주소로 정밀 치환
-            old_first_line = lines[0]
+            # 첫 줄의 브릿지 주소를 카메라 주소로 치환
             if b_addr in lines[0]:
+                old_line = lines[0]
                 lines[0] = lines[0].replace(b_addr, c_addr)
-                print(f"[{get_time()}] [{name}] [BRIDGE -> CAMERA] {lines[0]} (IP FIXED)")
-            else:
-                print(f"[{get_time()}] [{name}] [BRIDGE -> CAMERA] {lines[0]} (NO CHANGE)")
-
-            # Authorization 헤더가 있는지 확인하고 로그 출력
+                print(f"[{get_time()}] [{name}] [TO CAMERA  ] {lines[0]} (IP FIXED)")
+            
+            # Authorization 헤더 로그 출력 및 보존
             for line in lines:
                 if line.lower().startswith("authorization:"):
-                    print(f"[{get_time()}] [{name}] [AUTH-HEADER] {line.strip()} (PRESERVED)")
-                    # 인증 헤더는 절대로 수정하지 않음 (Digest Hash 보존)
+                    print(f"[{get_time()}] [{name}] [AUTH-INFO ] {line.strip()} (PRESERVED)")
         
         return "\r\n".join(lines).encode('utf-8')
     except Exception as e:
@@ -55,19 +55,19 @@ def process_client_to_camera(data, b_addr, c_addr, name):
 
 def process_camera_to_client(data, c_addr, b_addr, name):
     """
-    카메라 -> 내 PC: 응답 메시지 내의 모든 카메라 IP를 브릿지 IP로 치환
+    카메라 -> 내 PC: 응답 내의 모든 카메라 IP를 브릿지 IP로 치환
     """
     try:
         text = data.decode('utf-8', errors='ignore')
         if text.startswith("RTSP/1.0"):
-            print(f"[{get_time()}] [{name}] [CAMERA -> BRIDGE] {text.splitlines()[0]}")
+            print(f"[{get_time()}] [{name}] [FROM CAMERA] {text.splitlines()[0]}")
             
         if c_addr in text:
             new_text = text.replace(c_addr, b_addr)
-            # 주소 변환 로그 (Content-Base 등)
+            # 변환된 주소 로그 출력 (Content-Base 등)
             for line in text.splitlines():
                 if "rtsp://" in line and c_addr in line:
-                    print(f"[{get_time()}] [{name}] [BRIDGE -> CLIENT] {line.replace(c_addr, b_addr).strip()} (IP RESTORED)")
+                    print(f"[{get_time()}] [{name}] [TO CLIENT  ] {line.replace(c_addr, b_addr).strip()}")
             return new_text.encode('utf-8')
     except:
         pass
@@ -89,7 +89,9 @@ async def pipe(reader, writer, b_addr, c_addr, name, direction):
             writer.write(data)
             await writer.drain()
     except: pass
-    finally: writer.close()
+    finally:
+        if not writer.is_closing():
+            writer.close()
 
 async def handle_client(client_reader, client_writer, camera_info):
     name, b_port, c_ip, c_port = camera_info
@@ -100,14 +102,14 @@ async def handle_client(client_reader, client_writer, camera_info):
 
     try:
         remote_reader, remote_writer = await asyncio.open_connection(c_ip, c_port)
-        print(f"[{get_time()}] [.] [{name}] Internal Camera Link Ready")
+        print(f"[{get_time()}] [.] [{name}] Camera Connected: {c_ip}")
         
         await asyncio.gather(
             pipe(client_reader, remote_writer, b_addr, c_addr, name, ">>"),
             pipe(remote_reader, client_writer, b_addr, c_addr, name, "<<")
         )
     except Exception as e:
-        print(f"[{get_time()}] [-] [{name}] Error: {e}")
+        print(f"[{get_time()}] [-] [{name}] Fail: {e}")
     finally:
         print(f"[{get_time()}] [x] [{name}] Connection Closed\n")
         client_writer.close()
