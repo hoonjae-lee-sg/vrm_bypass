@@ -1,6 +1,5 @@
 import asyncio
 from datetime import datetime
-import re
 
 # ==========================================
 # 설정 정보
@@ -17,56 +16,40 @@ CAMERAS = [
 def get_time():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-def process_client_to_camera(data, b_addr, c_addr, name):
+def process_client_to_camera(data, name):
     """
-    내 PC -> 카메라: 첫 줄 URI만 수정하고 Authorization 헤더는 보존 (Digest 해시 깨짐 방지)
+    내 PC -> 카메라: 데이터를 변조하지 않고 그대로 전달 (인증/세션 보존)
     """
     try:
         text = data.decode('utf-8', errors='ignore')
         lines = text.split("\r\n")
-        if not lines: return data
-        
-        is_modified = False
-        # 1. 첫 번째 줄(Request-Line) 처리
-        if "rtsp://" in lines[0] and b_addr in lines[0]:
-            old_first = lines[0]
-            lines[0] = lines[0].replace(b_addr, c_addr)
-            print(f"[{get_time()}] [{name}] >> [REQ-LINE TRANSFORMED]")
-            print(f"  - FROM: {old_first}")
-            print(f"  - TO  : {lines[0]}")
-            is_modified = True
-            
-        # 2. Authorization 헤더 확인 (로그만 찍고 치환은 안 함 - 중요!)
-        for line in lines:
-            if line.startswith("Authorization:"):
-                print(f"[{get_time()}] [{name}] >> [AUTH-HEADER DETECTED (PRESERVED)]")
-                print(f"  - KEEP: {line.strip()}")
-                break
-
-        if is_modified:
-            return "\r\n".join(lines).encode('utf-8')
-    except Exception as e:
-        print(f"[{get_time()}] [!] [{name}] Request Error: {e}")
+        if lines and "rtsp://" in lines[0]:
+            print(f"[{get_time()}] [{name}] >> [FORWARDING UNTOUCHED]")
+            # 요청받은 전체 RTSP 주소와 헤더 정보를 상세히 출력
+            for line in lines:
+                if "rtsp://" in line or "Authorization" in line:
+                    print(f"  - {line.strip()}")
+    except:
+        pass
     return data
 
 def process_camera_to_client(data, c_addr, b_addr, name):
     """
-    카메라 -> 내 PC: 응답 내의 모든 카메라 IP를 브릿지 IP로 치환 (Content-Base 등)
+    카메라 -> 내 PC: 응답 내의 카메라 주소만 브릿지 주소로 치환하여 세션 유지
     """
     try:
         text = data.decode('utf-8', errors='ignore')
-        # 응답 상태 로그 출력
         if text.startswith("RTSP/1.0"):
             print(f"[{get_time()}] [{name}] << [RES] {text.splitlines()[0]}")
             
         if c_addr in text:
             new_text = text.replace(c_addr, b_addr)
-            # 변환 로그 출력
+            # 변환된 주소 로그 출력
             for line in text.splitlines():
                 if "rtsp://" in line and c_addr in line:
-                    print(f"[{get_time()}] [{name}] << [ADDR TRANSFORMED]")
-                    print(f"  - FROM: {line.strip()}")
-                    print(f"  - TO  : {line.replace(c_addr, b_addr).strip()}")
+                    print(f"[{get_time()}] [{name}] << [ADDR REPLACED]")
+                    print(f"    FROM: {line.strip()}")
+                    print(f"    TO  : {line.replace(c_addr, b_addr).strip()}")
             return new_text.encode('utf-8')
     except:
         pass
@@ -78,11 +61,11 @@ async def pipe(reader, writer, b_addr, c_addr, name, direction):
             data = await reader.read(65536)
             if not data: break
             
-            # RTSP 제어 메시지 감지
+            # RTSP 제어 메시지(텍스트) 감지
             if data.startswith((b'DESCRIBE', b'SETUP', b'PLAY', b'OPTIONS', b'RTSP/1.0', b'GET_PARAMETER', b'ANNOUNCE')):
-                if direction == ">>": # 내 PC -> 카메라
-                    data = process_client_to_camera(data, b_addr, c_addr, name)
-                else: # 카메라 -> 내 PC
+                if direction == ">>": # 내 PC -> 카메라 (무변조 통과)
+                    data = process_client_to_camera(data, name)
+                else: # 카메라 -> 내 PC (주소 치환)
                     data = process_camera_to_client(data, c_addr, b_addr, name)
             
             writer.write(data)
@@ -113,7 +96,7 @@ async def handle_client(client_reader, client_writer, camera_info):
 
 async def main():
     print("="*80)
-    print(f" RTSP Surgical Bypass Proxy (Auth Preserved) ")
+    print(f" RTSP Transparent Proxy (Session & Auth Fixed) ")
     print("="*80)
     
     tasks = []
