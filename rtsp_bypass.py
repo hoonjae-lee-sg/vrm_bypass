@@ -1,42 +1,74 @@
 import asyncio
 from datetime import datetime
+import re
 
 # ==========================================
 # 설정 정보
 # ==========================================
 BRIDGE_IP = "0.0.0.0"
-MY_BRIDGE_IP = "192.168.2.183"  # 내 PC에서 접속하는 브릿지 IP
+MY_BRIDGE_IP = "192.168.2.183"
 
-# 실제 카메라 13개의 내부망 IP를 여기에 정확히 적어주세요.
+# 카메라 리스트: (이름, 브릿지포트, 실제카메라IP, 카메라포트, 아이디, 비밀번호)
+# 비밀번호에 특수문자가 있다면 %23 처럼 인코딩된 형태를 그대로 적으셔도 됩니다.
 CAMERAS = [
-    ("CH01", 8554, "10.10.1.10", 554),
-    ("CH02", 8555, "10.10.1.11", 554),
-    # ... 필요한 만큼 추가
+    ("CH01", 8554, "10.10.1.110", 554, "admin", "SuperGate%23001"),
+    # ("CH02", 8555, "10.10.1.111", 554, "admin", "SuperGate%23001"),
+    # ... 나머지 13번까지 동일하게 추가
 ]
 
 def get_time():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-async def proxy_task(reader, writer, search_str, replace_str, name, direction):
-    """데이터를 읽어서 주소 치환 후 전달하는 핵심 태스크"""
+def inject_auth_and_fix_ip(text, search_addr, camera_addr, user, password):
+    """
+    주소를 브릿지IP -> 카메라IP로 바꾸면서, 아이디:비밀번호가 없으면 삽입함
+    """
+    lines = text.splitlines()
+    if not lines: return text
+
+    new_lines = []
+    for line in lines:
+        # rtsp:// 주소가 포함된 라인만 처리
+        if "rtsp://" in line:
+            # 1. 주소 치환 (192.168.2.183:8554 -> 10.10.1.110:554)
+            line = line.replace(search_addr, camera_addr)
+            
+            # 2. 인증 정보 삽입 (아이디:비번@ 가 없는 경우에만)
+            if f"{user}:" not in line and "@" not in line:
+                line = line.replace("rtsp://", f"rtsp://{user}:{password}@")
+        
+        new_lines.append(line)
+    
+    return "\r\n".join(new_lines) + "\r\n"
+
+async def proxy_task(reader, writer, camera_info, direction):
+    """데이터 중계 및 인증/주소 정보 수정"""
+    name, b_port, c_ip, c_port, user, pw = camera_info
+    bridge_addr = f"{MY_BRIDGE_IP}:{b_port}"
+    camera_addr = f"{c_ip}:{c_port}"
+
     try:
         while not reader.at_eof():
             data = await reader.read(65536)
             if not data: break
             
-            # RTSP 제어 메시지(텍스트)인 경우에만 주소 치환
+            # RTSP 제어 패킷(텍스트) 감지
             if data.startswith((b'DESCRIBE', b'SETUP', b'PLAY', b'OPTIONS', b'RTSP/1.0', b'GET_PARAMETER')):
                 try:
-                    # 바이너리 안전을 위해 문자열 치환 후 다시 인코딩
                     text = data.decode('utf-8', errors='ignore')
-                    if search_str in text:
-                        new_text = text.replace(search_str, replace_str)
-                        # 디버깅 로그: 무엇이 어떻게 바뀌었는지 출력
-                        print(f"[{get_time()}] [{name}] {direction} {text.splitlines()[0]} -> (FIXED)")
+                    
+                    if direction == ">>": # 내 PC -> 카메라 (인증 삽입 및 주소 수정)
+                        new_text = inject_auth_and_fix_ip(text, bridge_addr, camera_addr, user, pw)
+                        print(f"[{get_time()}] [{name}] >> REQ FIXED: {new_text.splitlines()[0]}")
                         data = new_text.encode('utf-8')
-                except:
-                    pass
-            
+                    else: # 카메라 -> 내 PC (주소만 브릿지로 복구)
+                        new_text = text.replace(camera_addr, bridge_addr)
+                        # 카메라가 보낸 401이나 200 상태 확인을 위한 로그
+                        print(f"[{get_time()}] [{name}] << RES: {new_text.splitlines()[0]}")
+                        data = new_text.encode('utf-8')
+                except Exception as e:
+                    print(f"[{get_time()}] [!] [{name}] Error processing text: {e}")
+
             writer.write(data)
             await writer.drain()
     except:
@@ -44,45 +76,40 @@ async def proxy_task(reader, writer, search_str, replace_str, name, direction):
     finally:
         writer.close()
 
-async def handle_client(client_reader, client_writer, camera_ip, camera_port, name):
-    """새로운 연결이 들어왔을 때 실행"""
+async def handle_client(client_reader, client_writer, camera_info):
+    name = camera_info[0]
+    c_ip = camera_info[2]
     client_info = client_writer.get_extra_info('peername')
-    print(f"[{get_time()}] [+] [{name}] 연결 감지: {client_info[0]}:{client_info[1]}")
-    
-    # 치환 타겟 설정
-    # 내 PC는 192.168.2.183:8554 로 알고 있고, 카메라는 10.10.1.10:554 로 알고 있음
-    bridge_addr = f"{MY_BRIDGE_IP}:{client_writer.get_extra_info('sockname')[1]}"
-    camera_addr = f"{camera_ip}:{camera_port}"
+    print(f"\n[{get_time()}] [+] [{name}] New Connection from {client_info[0]}")
 
     try:
-        # 카메라로 연결 시도
-        remote_reader, remote_writer = await asyncio.open_connection(camera_ip, camera_port)
-        print(f"[{get_time()}] [.] [{name}] 카메라 연결 성공 ({camera_ip})")
+        # 실제 카메라와 통신 시작
+        remote_reader, remote_writer = await asyncio.open_connection(c_ip, camera_info[3])
+        print(f"[{get_time()}] [.] [{name}] Internal Camera Connected ({c_ip})")
         
-        # 양방향 중계 시작 (치환 포함)
         await asyncio.gather(
-            proxy_task(client_reader, remote_writer, bridge_addr, camera_addr, name, ">>"),
-            proxy_task(remote_reader, client_writer, camera_addr, bridge_addr, name, "<<")
+            proxy_task(client_reader, remote_writer, camera_info, ">>"),
+            proxy_task(remote_reader, client_writer, camera_info, "<<")
         )
     except Exception as e:
-        print(f"[{get_time()}] [-] [{name}] 연결 실패: {e}")
+        print(f"[{get_time()}] [-] [{name}] Error: {e}")
     finally:
-        print(f"[{get_time()}] [x] [{name}] 연결 종료")
+        print(f"[{get_time()}] [x] [{name}] Connection Closed\n")
         client_writer.close()
 
 async def main():
     print("="*60)
-    print(f" RTSP Multi-Channel Bypass Proxy (Bridge IP: {MY_BRIDGE_IP})")
+    print(f" RTSP Auth-Injection Proxy (Bridge: {MY_BRIDGE_IP})")
     print("="*60)
     
     servers = []
-    for name, local_port, camera_ip, camera_port in CAMERAS:
+    for info in CAMERAS:
+        # 각 카메라별로 서버 실행
         coro = await asyncio.start_server(
-            lambda r, w, c_ip=camera_ip, c_pt=camera_port, n=name: 
-                handle_client(r, w, c_ip, c_pt, n),
-            BRIDGE_IP, local_port
+            lambda r, w, i=info: handle_client(r, w, i),
+            BRIDGE_IP, info[1]
         )
-        print(f"[*] [{name}] 포트 {local_port} 대기 중... -> {camera_ip}")
+        print(f"[*] [{info[0]}] Monitoring Port {info[1]} -> {info[2]}")
         servers.append(coro.serve_forever())
     
     await asyncio.gather(*servers)
