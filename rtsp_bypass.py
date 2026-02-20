@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime
-import re
+import random
 
 # ==========================================
 # 설정 정보
@@ -11,112 +11,107 @@ MY_BRIDGE_IP = "192.168.2.183"
 CAMERAS = [
     ("CH01", 8554, "10.10.1.110", 554),
     ("CH02", 8555, "10.10.1.111", 554),
-    # ... 나머지 13번까지 추가
+    # ... 나머지 채널 추가
 ]
 
 def get_time():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-def process_client_to_camera(data, b_addr, c_addr, name):
+def process_rtsp_text(data, b_addr, c_addr, name, conn_id, direction):
     """
-    내 PC -> 카메라: 
-    1. 요청 첫 줄(Request-Line)의 주소만 카메라 IP로 치환 (454 에러 방지)
-    2. Authorization 헤더의 주소는 그대로 유지 (401 인증 에러 방지)
+    RTSP 제어 메시지(텍스트)만 안전하게 치환. 
+    바이너리 데이터가 섞여 있어도 헤더 부분만 정밀 타격함.
     """
+    # Interleaved RTP 패킷($로 시작)은 절대 건드리지 않음
+    if data.startswith(b'$'):
+        return data
+
     try:
-        # 바이트 데이터를 문자열로 변환
-        text = data.decode('utf-8', errors='ignore')
+        # RTSP 메시지는 항상 \r\n\r\n으로 헤더가 끝남
+        header_end = data.find(b"\r\n\r\n")
+        if header_end == -1:
+            # 헤더가 한 패킷에 다 안 들어온 경우 전체를 텍스트로 시도
+            header_part = data
+            body_part = b""
+        else:
+            header_part = data[:header_end + 4]
+            body_part = data[header_end + 4:]
+
+        text = header_part.decode('utf-8', errors='ignore')
         lines = text.split("\r\n")
-        if not lines or not lines[0]: return data
-
-        # [로그] 클라이언트로부터 받은 원본 데이터 출력
-        print(f"[{get_time()}] [{name}] [FROM CLIENT] {lines[0]}")
-
-        # RTSP 메서드 확인 (문자열 비교로 수정)
-        verbs = ['DESCRIBE', 'SETUP', 'PLAY', 'OPTIONS', 'TEARDOWN', 'GET_PARAMETER']
-        is_request_line = any(lines[0].startswith(verb) for verb in verbs)
         
-        if is_request_line:
-            # 첫 줄의 브릿지 주소를 카메라 주소로 치환
-            if b_addr in lines[0]:
-                old_line = lines[0]
-                lines[0] = lines[0].replace(b_addr, c_addr)
-                print(f"[{get_time()}] [{name}] [TO CAMERA  ] {lines[0]} (IP FIXED)")
+        if not lines or not lines[0]:
+            return data
+
+        is_request = any(lines[0].startswith(v) for v in ['DESCRIBE', 'SETUP', 'PLAY', 'OPTIONS', 'TEARDOWN', 'GET_PARAMETER'])
+        is_response = lines[0].startswith('RTSP/1.0')
+
+        if is_request or is_response:
+            if direction == ">>": # 내 PC -> 카메라
+                # 첫 줄 URI 치환 (454 에러 방지)
+                if b_addr in lines[0]:
+                    old = lines[0]
+                    lines[0] = lines[0].replace(b_addr, c_addr)
+                    print(f"[{get_time()}] [{name}-{conn_id}] >> [FIXED] {lines[0]}")
+                # Auth 헤더는 보존 (로그만 출력)
+                for line in lines:
+                    if line.lower().startswith("authorization:"):
+                        print(f"[{get_time()}] [{name}-{conn_id}] >> [AUTH] {line.strip()}")
+            else: # 카메라 -> 내 PC
+                print(f"[{get_time()}] [{name}-{conn_id}] << [RES] {lines[0]}")
+                # 응답 내 모든 카메라 주소를 브릿지 주소로 복구
+                text = "\r\n".join(lines).replace(c_addr, b_addr)
+                header_part = text.encode('utf-8')
             
-            # Authorization 헤더 로그 출력 및 보존
-            for line in lines:
-                if line.lower().startswith("authorization:"):
-                    print(f"[{get_time()}] [{name}] [AUTH-INFO ] {line.strip()} (PRESERVED)")
-        
-        return "\r\n".join(lines).encode('utf-8')
+            return header_part + body_part
+            
     except Exception as e:
-        print(f"[{get_time()}] [!] [{name}] Request Processing Error: {e}")
+        print(f"[{get_time()}] [!] [{name}-{conn_id}] Error: {e}")
+    
     return data
 
-def process_camera_to_client(data, c_addr, b_addr, name):
-    """
-    카메라 -> 내 PC: 응답 내의 모든 카메라 IP를 브릿지 IP로 치환
-    """
-    try:
-        text = data.decode('utf-8', errors='ignore')
-        if text.startswith("RTSP/1.0"):
-            print(f"[{get_time()}] [{name}] [FROM CAMERA] {text.splitlines()[0]}")
-            
-        if c_addr in text:
-            new_text = text.replace(c_addr, b_addr)
-            # 변환된 주소 로그 출력 (Content-Base 등)
-            for line in text.splitlines():
-                if "rtsp://" in line and c_addr in line:
-                    print(f"[{get_time()}] [{name}] [TO CLIENT  ] {line.replace(c_addr, b_addr).strip()}")
-            return new_text.encode('utf-8')
-    except:
-        pass
-    return data
-
-async def pipe(reader, writer, b_addr, c_addr, name, direction):
+async def pipe(reader, writer, b_addr, c_addr, name, conn_id, direction):
     try:
         while not reader.at_eof():
             data = await reader.read(65536)
             if not data: break
             
-            # RTSP 제어 메시지(텍스트) 감지
-            if data.startswith((b'DESCRIBE', b'SETUP', b'PLAY', b'OPTIONS', b'RTSP/1.0', b'GET_PARAMETER', b'ANNOUNCE')):
-                if direction == ">>": # 내 PC -> 카메라
-                    data = process_client_to_camera(data, b_addr, c_addr, name)
-                else: # 카메라 -> 내 PC
-                    data = process_camera_to_client(data, c_addr, b_addr, name)
+            # RTSP 텍스트 메시지 가능성이 있는 경우만 처리
+            # $ (0x24)로 시작하는 바이너리 데이터는 무조건 통과 (PTS 보존 핵심)
+            if not data.startswith(b'$'):
+                data = process_rtsp_text(data, b_addr, c_addr, name, conn_id, direction)
             
             writer.write(data)
             await writer.drain()
     except: pass
     finally:
-        if not writer.is_closing():
-            writer.close()
+        if not writer.is_closing(): writer.close()
 
 async def handle_client(client_reader, client_writer, camera_info):
     name, b_port, c_ip, c_port = camera_info
+    conn_id = random.randint(1000, 9999) # 연결 식별용
     b_addr = f"{MY_BRIDGE_IP}:{b_port}"
     c_addr = f"{c_ip}:{c_port}"
 
-    print(f"\n[{get_time()}] [+] [{name}] Connection Started")
+    print(f"\n[{get_time()}] [+] [{name}-{conn_id}] New Connection Started")
 
     try:
         remote_reader, remote_writer = await asyncio.open_connection(c_ip, c_port)
-        print(f"[{get_time()}] [.] [{name}] Camera Connected: {c_ip}")
+        print(f"[{get_time()}] [.] [{name}-{conn_id}] Camera Connected: {c_ip}")
         
         await asyncio.gather(
-            pipe(client_reader, remote_writer, b_addr, c_addr, name, ">>"),
-            pipe(remote_reader, client_writer, b_addr, c_addr, name, "<<")
+            pipe(client_reader, remote_writer, b_addr, c_addr, name, conn_id, ">>"),
+            pipe(remote_reader, client_writer, b_addr, c_addr, name, conn_id, "<<")
         )
     except Exception as e:
-        print(f"[{get_time()}] [-] [{name}] Fail: {e}")
+        print(f"[{get_time()}] [-] [{name}-{conn_id}] Connection Failed: {e}")
     finally:
-        print(f"[{get_time()}] [x] [{name}] Connection Closed\n")
+        print(f"[{get_time()}] [x] [{name}-{conn_id}] Connection Closed\n")
         client_writer.close()
 
 async def main():
     print("="*80)
-    print(f" RTSP Precision Bypass Proxy (Bridge: {MY_BRIDGE_IP})")
+    print(f" RTSP Binary-Safe Proxy (PTS/Metadata Fully Preserved) ")
     print("="*80)
     
     tasks = []
@@ -125,7 +120,7 @@ async def main():
             lambda r, w, i=info: handle_client(r, w, i),
             BRIDGE_IP, info[1]
         )
-        print(f"[*] [{info[0]}] Port {info[1]} -> {info[2]}")
+        print(f"[*] [{info[0]}] Monitoring Port {info[1]} -> {info[2]}")
         tasks.append(server.serve_forever())
     
     await asyncio.gather(*tasks)
