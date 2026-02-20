@@ -18,57 +18,49 @@ def get_time():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 def process_rtsp_text(data, b_addr, c_addr, name, conn_id, direction):
-    """
-    RTSP 제어 메시지(텍스트)만 안전하게 치환. 
-    바이너리 데이터가 섞여 있어도 헤더 부분만 정밀 타격함.
-    """
-    # Interleaved RTP 패킷($로 시작)은 절대 건드리지 않음
-    if data.startswith(b'$'):
-        return data
+    RTSP_KEYWORDS = [b'DESCRIBE', b'SETUP', b'PLAY', b'OPTIONS', b'TEARDOWN', b'GET_PARAMETER', b'RTSP/1.0', b'ANNOUNCE', b'RECORD']
 
+    # 패킷이 RTSP 키워드로 시작하는지 엄격하게 검사
+    if not any(data.startswith(k) for k in RTSP_KEYWORDS):
+        return data  # RTSP 텍스트가 아니면 원본 데이터 반환
+    
     try:
-        # RTSP 메시지는 항상 \r\n\r\n으로 헤더가 끝남
+        # RTSP 헤더와 바디 분리 (헤더 끝은 \r\n\r\n)
         header_end = data.find(b"\r\n\r\n")
         if header_end == -1:
-            # 헤더가 한 패킷에 다 안 들어온 경우 전체를 텍스트로 시도
+            # 헤더 끝이 없는 경우 (비정상 패킷) - 전체를 헤더로 간주
             header_part = data
             body_part = b""
         else:
+            # header_part : RTSP 메시지의 헤더 부분 (텍스트)
             header_part = data[:header_end + 4]
+            # body_part : 헤더 끝 이후의 데이터 (RTSP 메시지의 바디, 예: SDP 등)
             body_part = data[header_end + 4:]
+            
 
+        # 헤더 부분만 텍스트로 디코딩
         text = header_part.decode('utf-8', errors='ignore')
-        lines = text.split("\r\n")
+
+        # 주소 치환 로직
+        if direction == ">>":
+            if b_addr in text: # 클라이언트 -> 카메라 방향에서는 브리지 주소를 카메라 주소로 치환
+                text = text.replace(b_addr, c_addr)
+                # 로그 출력
+                first_line = text.split("\r\n")[0]
+                print(f"[{get_time()}] [{name}-{conn_id}] >> [FIXED] {first_line}")
+
+        else:
+            if c_addr in text: # 카메라 -> 클라이언트 방향에서는 카메라 주소를 브리지 주소로 치환
+                text = text.replace(c_addr, b_addr)
+                # 로그 출력
+                first_line = text.split("\r\n")[0]
+                print(f"[{get_time()}] [{name}-{conn_id}] << [RES] {first_line}")
         
-        if not lines or not lines[0]:
-            return data
+        return text.encode('utf-8') + body_part  # 수정된 헤더와 원본 바디를 합쳐서 반환
 
-        is_request = any(lines[0].startswith(v) for v in ['DESCRIBE', 'SETUP', 'PLAY', 'OPTIONS', 'TEARDOWN', 'GET_PARAMETER'])
-        is_response = lines[0].startswith('RTSP/1.0')
-
-        if is_request or is_response:
-            if direction == ">>": # 내 PC -> 카메라
-                # 첫 줄 URI 치환 (454 에러 방지)
-                if b_addr in lines[0]:
-                    old = lines[0]
-                    lines[0] = lines[0].replace(b_addr, c_addr)
-                    print(f"[{get_time()}] [{name}-{conn_id}] >> [FIXED] {lines[0]}")
-                # Auth 헤더는 보존 (로그만 출력)
-                for line in lines:
-                    if line.lower().startswith("authorization:"):
-                        print(f"[{get_time()}] [{name}-{conn_id}] >> [AUTH] {line.strip()}")
-            else: # 카메라 -> 내 PC
-                print(f"[{get_time()}] [{name}-{conn_id}] << [RES] {lines[0]}")
-                # 응답 내 모든 카메라 주소를 브릿지 주소로 복구
-                text = "\r\n".join(lines).replace(c_addr, b_addr)
-                header_part = text.encode('utf-8')
-            
-            return header_part + body_part
-            
     except Exception as e:
-        print(f"[{get_time()}] [!] [{name}-{conn_id}] Error: {e}")
-    
-    return data
+        print(f"[{get_time()}] [!] [{name}-{conn_id}] RTSP Text Processing Error: {e}")
+        return data  # 오류 발생 시 원본 데이터 반환
 
 async def pipe(reader, writer, b_addr, c_addr, name, conn_id, direction):
     try:
