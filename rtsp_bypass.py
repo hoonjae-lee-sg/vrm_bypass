@@ -25,39 +25,35 @@ def process_rtsp_text(data, b_addr, c_addr, name, conn_id, direction):
         return data  # RTSP 텍스트가 아니면 원본 데이터 반환
     
     try:
-        # RTSP 헤더와 바디 분리 (헤더 끝은 \r\n\r\n)
-        header_end = data.find(b"\r\n\r\n")
-        if header_end == -1:
-            # 헤더 끝이 없는 경우 (비정상 패킷) - 전체를 헤더로 간주
-            header_part = data
-            body_part = b""
-        else:
-            # header_part : RTSP 메시지의 헤더 부분 (텍스트)
-            header_part = data[:header_end + 4]
-            # body_part : 헤더 끝 이후의 데이터 (RTSP 메시지의 바디, 예: SDP 등)
-            body_part = data[header_end + 4:]
-            
+        header_end = data.find(b'\r\n\r\n')
+        header_part = data[:header_end + 4] if header_end != -1 else data
+        body_part = data[header_end + 4:] if header_end != -1 else b''
 
-        # 헤더 부분만 텍스트로 디코딩
-        text = header_part.decode('utf-8', errors='ignore')
+        text = header_part.decode('utf-8',errors='ignore')
+        lines = text.split('\r\n')
+        new_lines = []
 
-        # 주소 치환 로직
-        if direction == ">>":
-            if b_addr in text: # 클라이언트 -> 카메라 방향에서는 브리지 주소를 카메라 주소로 치환
-                text = text.replace(b_addr, c_addr)
-                # 로그 출력
-                first_line = text.split("\r\n")[0]
-                print(f"[{get_time()}] [{name}-{conn_id}] >> [FIXED] {first_line}")
+        for i, line in enumerate(lines):
+            if i == 0:
+                if direction == ">>":
+                    line = line.replace(b_addr, c_addr)
+                else:
+                    line = line.replace(c_addr, b_addr)
+                new_lines.append(line)
+                continue
 
-        else:
-            if c_addr in text: # 카메라 -> 클라이언트 방향에서는 카메라 주소를 브리지 주소로 치환
-                text = text.replace(c_addr, b_addr)
-                # 로그 출력
-                first_line = text.split("\r\n")[0]
-                print(f"[{get_time()}] [{name}-{conn_id}] << [RES] {first_line}")
-        
-        return text.encode('utf-8') + body_part  # 수정된 헤더와 원본 바디를 합쳐서 반환
+            if line.lower().startswith("authorization:"):
+                new_lines.append(line)  # 인증 정보는 그대로 유지
+                continue
 
+            if direction == ">>":
+                line = line.replace(b_addr, c_addr)
+            else:
+                line = line.replace(c_addr, b_addr)
+            new_lines.append(line)
+
+        final_text = '\r\n'.join(new_lines)
+        return final_text.encode('utf-8') + body_part
     except Exception as e:
         print(f"[{get_time()}] [!] [{name}-{conn_id}] RTSP Text Processing Error: {e}")
         return data  # 오류 발생 시 원본 데이터 반환
