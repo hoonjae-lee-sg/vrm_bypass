@@ -42,16 +42,24 @@ def rewrite_rtsp_message(data, b_addr, c_addr, direction):
 
         lines = header_raw.split('\r\n')
         new_lines = []
-        for line in lines:
-            if line.lower().startswith("authorization:"):
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+
+            if line_lower.startswith('authorization:', 'www-authenticate:', 'proxy-authenticate:', 'proxy-authorization:'):
                 new_lines.append(line)
                 continue
-
-            if direction == ">>":
-                line = line.replace(b_addr,c_addr)
+            
+            if i == 0 and direction ==">>":
+                new_lines.append(line)
+                continue
+            
+            if any(line_lower.startswith(h) for h in ['transport:', 'location:', 'content-base:', 'content-location:']):
+                if direction == ">>":
+                    new_lines.append(line.replace(b_addr,c_addr))
+                else:
+                    new_lines.append(line.replace(c_addr,b_addr))
             else:
-                line = line.replace(c_addr,b_addr)
-            new_lines.append(line)
+                new_lines.append(line)
         new_header = '\r\n'.join(new_lines) + '\r\n\r\n'
         return new_header.encode('utf-8') + body
     
