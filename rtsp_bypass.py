@@ -2,8 +2,6 @@ import asyncio
 from datetime import datetime
 import random
 
-from matplotlib import text
-
 # ==========================================
 # 설정 정보
 # ==========================================
@@ -57,7 +55,7 @@ async def proxy_engine(reader, writer, b_addr, c_addr, name ,conn_id, direction)
             # 첫 바이트에 따라 처리 로직 추가
             if first_byte == b'$':
                 header = await reader.readexactly(3)  # RTP/RTCP 헤더
-                length = int.from_item(header[1:], byteorder='big')
+                length = int.from_bytes(header[1:], byteorder='big')
                 payload = await reader.readexactly(length)
 
                 writer.write(b'$' + header + payload)
