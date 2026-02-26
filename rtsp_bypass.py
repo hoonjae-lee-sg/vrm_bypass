@@ -2,6 +2,8 @@ import asyncio
 from datetime import datetime
 import random
 
+from matplotlib import text
+
 # ==========================================
 # 설정 정보
 # ==========================================
@@ -17,85 +19,66 @@ CAMERAS = [
 def get_time():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
-def process_rtsp_text(data, b_addr, c_addr, name, conn_id, direction):
-    RTSP_KEYWORDS = [b'DESCRIBE', b'SETUP', b'PLAY', b'OPTIONS', b'TEARDOWN', b'GET_PARAMETER', b'RTSP/1.0', b'ANNOUNCE', b'RECORD']
-
-    # 패킷이 RTSP 키워드로 시작하는지 엄격하게 검사
-    if not any(data.startswith(k) for k in RTSP_KEYWORDS):
-        return data  # RTSP 텍스트가 아니면 원본 데이터 반환
-    
+def rewrite_rtsp_message(data, b_addr, c_addr, direction):
+    """RTSP 제어 메시지의 IP 주소를 변경하고 Content-Length를 유지함"""
     try:
-        header_end = data.find(b'\r\n\r\n')
-        header_part = data[:header_end + 4] if header_end != -1 else data
-        body_part = data[header_end + 4:] if header_end != -1 else b''
+        text = data.decode('utf-8', errors='ignore')
+        if direction == ">>":
+            new_text = text.replace(b_addr, c_addr)
+        else:
+            new_text = text.replace(c_addr, b_addr)
+        return new_text.encode('utf-8')
+    except:
+        return data
 
-        text = header_part.decode('utf-8',errors='ignore')
-        lines = text.split('\r\n')
-        new_lines = []
-
-        for i, line in enumerate(lines):
-            if i == 0:
-                if direction == ">>":
-                    line = line.replace(b_addr, c_addr)
-                else:
-                    line = line.replace(c_addr, b_addr)
-                new_lines.append(line)
-                continue
-
-            if line.lower().startswith("authorization:"):
-                new_lines.append(line)  # 인증 정보는 그대로 유지
-                continue
-
-            if direction == ">>":
-                line = line.replace(b_addr, c_addr)
-            else:
-                line = line.replace(c_addr, b_addr)
-            new_lines.append(line)
-
-        final_text = '\r\n'.join(new_lines)
-        return final_text.encode('utf-8') + body_part
-    except Exception as e:
-        print(f"[{get_time()}] [!] [{name}-{conn_id}] RTSP Text Processing Error: {e}")
-        return data  # 오류 발생 시 원본 데이터 반환
-
-async def pipe(reader, writer, b_addr, c_addr, name, conn_id, direction):
+async def proxy_engine(reader, writer, b_addr, c_addr, name ,conn_id, direction):
+    """RTSP/RTP 프로토콜을 바이트 단위로 분서갛여 바이너리 오염을 원천 차단"""
     try:
         while not reader.at_eof():
-            data = await reader.read(65536)
-            if not data: break
-            
-            # RTSP 텍스트 메시지 가능성이 있는 경우만 처리
-            # $ (0x24)로 시작하는 바이너리 데이터는 무조건 통과 (PTS 보존 핵심)
-            if not data.startswith(b'$'):
-                data = process_rtsp_text(data, b_addr, c_addr, name, conn_id, direction)
-            
-            writer.write(data)
+            first_byte = await reader.readexactly(1)
+            if not first_byte:
+                break
+            # 첫 바이트에 따라 처리 로직 추가
+            if first_byte == b'$':
+                header = await reader.readexactly(3)  # RTP/RTCP 헤더
+                length = int.from_item(header[1:], byteorder='big')
+                payload = await reader.readexactly(length)
+
+                writer.write(b'$' + header + payload)
+
+            else:
+                line_buffer = first_byte
+                while b'\r\n\r\n' not in line_buffer:
+                    chunk = await reader.readuntil(b'\n')
+                    line_buffer += chunk
+
+                modified_msg = rewrite_rtsp_message(line_buffer,b_addr,c_addr, direction)
+                writer.write(modified_msg)
+
             await writer.drain()
-    except: pass
+    except asyncio.IncompleteReadError:
+        pass
+    except Exception as e:
+        print(f"[{get_time()}] [!] [{name}-{conn_id}] Proxy Error: {e}")
     finally:
-        if not writer.is_closing(): writer.close()
+        writer.close()
+
 
 async def handle_client(client_reader, client_writer, camera_info):
     name, b_port, c_ip, c_port = camera_info
-    conn_id = random.randint(1000, 9999) # 연결 식별용
+    conn_id = random.randint(1000, 9999)
+    print(f"[{get_time()}] [*] [{name}-{conn_id}] New Connection from {client_writer.get_extra_info('peername')}")
     b_addr = f"{MY_BRIDGE_IP}:{b_port}"
     c_addr = f"{c_ip}:{c_port}"
 
-    print(f"\n[{get_time()}] [+] [{name}-{conn_id}] New Connection Started")
-
     try:
         remote_reader, remote_writer = await asyncio.open_connection(c_ip, c_port)
-        print(f"[{get_time()}] [.] [{name}-{conn_id}] Camera Connected: {c_ip}")
-        
         await asyncio.gather(
-            pipe(client_reader, remote_writer, b_addr, c_addr, name, conn_id, ">>"),
-            pipe(remote_reader, client_writer, b_addr, c_addr, name, conn_id, "<<")
+            proxy_engine(client_reader, remote_writer, b_addr, c_addr, name, conn_id, ">>"),
+            proxy_engine(remote_reader, client_writer, b_addr, c_addr, name, conn_id, "<<")
         )
-    except Exception as e:
-        print(f"[{get_time()}] [-] [{name}-{conn_id}] Connection Failed: {e}")
-    finally:
-        print(f"[{get_time()}] [x] [{name}-{conn_id}] Connection Closed\n")
-        client_writer.close()
+    except: pass
+    finally: client_writer.close()
 
 async def main():
     print("="*80)
