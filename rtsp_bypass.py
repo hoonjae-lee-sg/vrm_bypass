@@ -36,34 +36,33 @@ def get_time():
 def rewrite_rtsp_message(data, b_addr, c_addr, direction):
     """RTSP 제어 메시지의 IP 주소를 변경하고 Content-Length를 유지함"""
     try:
-        parts = data.split(b'\r\n\r\n', 1)
-        header_raw = parts[0].decode('utf-8', errors='ignore')
-        body = parts[1] if len(parts) > 1 else b''
+        header_end = data.find(b'\r\n\r\n')
+        if header_end == -1: return data
+
+        header_raw = data[:header_end].decode('utf-8',errors='ignore')
+        body = data[header_end:]
 
         lines = header_raw.split('\r\n')
         new_lines = []
-        for i, line in enumerate(lines):
-            line_lower = line.lower()
 
-            if line_lower.startswith('authorization:', 'www-authenticate:', 'proxy-authenticate:', 'proxy-authorization:'):
-                new_lines.append(line)
-                continue
-            
-            if i == 0 and direction ==">>":
-                new_lines.append(line)
-                continue
-            
-            if any(line_lower.startswith(h) for h in ['transport:', 'location:', 'content-base:', 'content-location:']):
-                if direction == ">>":
+        for i, line in enumerate(lines):
+            line_l = line.lower()
+
+            if direction == ">>":
+                if i == 0 or line_l.startswith('authorization:'):
+                    new_lines.append(line)
+                elif any(x in line_l for x in ['transport:', 'proxy-']):
                     new_lines.append(line.replace(b_addr,c_addr))
                 else:
-                    new_lines.append(line.replace(c_addr,b_addr))
+                    new_lines.append(line)
             else:
-                new_lines.append(line)
-        new_header = '\r\n'.join(new_lines) + '\r\n\r\n'
-        return new_header.encode('utf-8') + body
-    
-    except:
+                if any(x in line_l for x in ['content-length:', 'transport:', 'proxy-']):
+                    new_lines.append(line.replace(c_addr,b_addr))
+                else:
+                    new_lines.append(line)
+        return '\r\n'.join(new_lines).encode('utf-8') + body
+    except Exception as e:
+        print(f"[!] Error rewriting RTSP message: {e}")
         return data
 async def proxy_engine(reader, writer, b_addr, c_addr, name ,conn_id, direction):
     """RTSP/RTP 프로토콜을 바이트 단위로 분석하여 바이너리 오염을 원천 차단"""
