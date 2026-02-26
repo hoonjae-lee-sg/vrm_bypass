@@ -36,17 +36,29 @@ def get_time():
 def rewrite_rtsp_message(data, b_addr, c_addr, direction):
     """RTSP 제어 메시지의 IP 주소를 변경하고 Content-Length를 유지함"""
     try:
-        text = data.decode('utf-8', errors='ignore')
-        if direction == ">>":
-            new_text = text.replace(b_addr, c_addr)
-        else:
-            new_text = text.replace(c_addr, b_addr)
-        return new_text.encode('utf-8')
+        parts = data.split(b'\r\n\r\n', 1)
+        header_raw = parts[0].decode('utf-8', errors='ignore')
+        body = parts[1] if len(parts) > 1 else b''
+
+        lines = header_raw.split('\r\n')
+        new_lines = []
+        for line in lines:
+            if line.lower().startswith("authorization:"):
+                new_lines.append(line)
+                continue
+
+            if direction == ">>":
+                line = line.replace(b_addr,c_addr)
+            else:
+                line = line.replace(c_addr,b_addr)
+            new_lines.append(line)
+        new_header = '\r\n'.join(new_lines) + '\r\n\r\n'
+        return new_header.encode('utf-8') + body
+    
     except:
         return data
-
 async def proxy_engine(reader, writer, b_addr, c_addr, name ,conn_id, direction):
-    """RTSP/RTP 프로토콜을 바이트 단위로 분서갛여 바이너리 오염을 원천 차단"""
+    """RTSP/RTP 프로토콜을 바이트 단위로 분석하여 바이너리 오염을 원천 차단"""
     try:
         while not reader.at_eof():
             first_byte = await reader.readexactly(1)
@@ -61,12 +73,18 @@ async def proxy_engine(reader, writer, b_addr, c_addr, name ,conn_id, direction)
                 writer.write(b'$' + header + payload)
 
             else:
-                line_buffer = first_byte
-                while b'\r\n\r\n' not in line_buffer:
-                    chunk = await reader.readuntil(b'\n')
-                    line_buffer += chunk
+                header_chunk = first_byte + await reader.readuntil(b'\r\n\r\n')  # RTSP 헤더
 
-                modified_msg = rewrite_rtsp_message(line_buffer,b_addr,c_addr, direction)
+                content_length = 0
+                for line in header_chunk.split(b'\r\n'):
+                    if line.lower().startswith(b'content-length:'):
+                        content_length = int(line.split(b':')[1].strip())
+                        break
+                full_message = header_chunk
+                if content_length > 0:
+                    body = await reader.readexactly(content_length)
+                    full_message += body
+                modified_msg = rewrite_rtsp_message(full_message,b_addr,c_addr, direction)
                 writer.write(modified_msg)
 
             await writer.drain()
