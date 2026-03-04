@@ -101,8 +101,7 @@ async def proxy_engine(reader, writer, b_addr, c_addr, name ,conn_id, direction)
                     full_message += body
                 modified_msg = rewrite_rtsp_message(full_message,b_addr,c_addr, direction)
                 writer.write(modified_msg)
-
-            await writer.drain()
+                await writer.drain()
     except asyncio.IncompleteReadError:
         pass
     except Exception as e:
@@ -119,12 +118,15 @@ async def handle_client(client_reader, client_writer, camera_info):
     c_addr = f"{c_ip}:{c_port}"
 
     try:
-        remote_reader, remote_writer = await asyncio.open_connection(c_ip, c_port)
+        remote_reader, remote_writer = await asyncio.open_connection(c_ip, c_port, limit=5*1024*1024)
+        client_reader._limit = 5*1024*1024
         await asyncio.gather(
             proxy_engine(client_reader, remote_writer, b_addr, c_addr, name, conn_id, ">>"),
-            proxy_engine(remote_reader, client_writer, b_addr, c_addr, name, conn_id, "<<")
+            proxy_engine(remote_reader, client_writer, b_addr, c_addr, name, conn_id, "<<"),
+            return_exceptions=True
         )
-    except: pass
+    except Exception as e:
+        print(f"[{get_time()}] [!] [{name}-{conn_id}] Connection Error: {e}")
     finally: client_writer.close()
 
 async def main():
@@ -136,7 +138,9 @@ async def main():
     for info in CAMERAS:
         server = await asyncio.start_server(
             lambda r, w, i=info: handle_client(r, w, i),
-            BRIDGE_IP, info[1]
+            BRIDGE_IP, info[1],
+            reuse_address=True,
+            limit=5*1024*1024
         )
         print(f"[*] [{info[0]}] Monitoring Port {info[1]} -> {info[2]}")
         tasks.append(server.serve_forever())
